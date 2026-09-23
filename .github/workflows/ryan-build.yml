@@ -1,0 +1,289 @@
+name: Ryan EasyTier Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ryan-easytier-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Web 前端只编译一次。
+  # 后面的各平台构建复用它，Magisk WebUI 也需要这里的 config-generator。
+  build_web:
+    name: Build Web Assets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build Web
+        uses: ./.github/actions/prepare-pnpm
+        with:
+          token: ${{ github.token }}
+          build-filter: './easytier-web/*'
+
+      - name: Upload Web Assets
+        uses: actions/upload-artifact@v5
+        with:
+          name: easytier-web-dashboard
+          path: easytier-web/frontend/dist/*
+          retention-days: 14
+
+  build:
+    name: Build ${{ matrix.ARTIFACT_NAME }}
+    needs: build_web
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - TARGET: x86_64-unknown-linux-musl
+            OS: ubuntu-24.04
+            ARTIFACT_NAME: linux-x86_64
+            ALLOCATOR: jemalloc
+
+          # Linux ARM64 / Android Magisk 使用这个
+          - TARGET: aarch64-unknown-linux-musl
+            OS: ubuntu-24.04-arm
+            ARTIFACT_NAME: linux-aarch64
+            ALLOCATOR: mimalloc
+
+          # Windows 11 x86_64 / AMD64
+          - TARGET: x86_64-pc-windows-msvc
+            OS: windows-latest
+            ARTIFACT_NAME: windows-x86_64
+            ALLOCATOR: mimalloc
+
+          # Apple Silicon / M1 M2 M3 M4
+          - TARGET: aarch64-apple-darwin
+            OS: macos-latest
+            ARTIFACT_NAME: macos-aarch64
+            ALLOCATOR: mimalloc
+
+    runs-on: ${{ matrix.OS }}
+
+    env:
+      TARGET: ${{ matrix.TARGET }}
+      ARTIFACT_NAME: ${{ matrix.ARTIFACT_NAME }}
+      ALLOCATOR: ${{ matrix.ALLOCATOR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build Info
+        run: |
+          echo "Commit: $GITHUB_SHA"
+          echo "Target: $TARGET"
+          echo "Artifact: $ARTIFACT_NAME"
+
+      - name: Download Web Assets
+        uses: actions/download-artifact@v5
+        with:
+          name: easytier-web-dashboard
+          path: easytier-web/frontend/dist/
+
+      # 只准备 Rust/Cargo 编译环境。
+      # Web 已经在 build_web 编译，不再每个平台重复跑 pnpm。
+      # 也不需要 GUI/GTK/Tauri 开发依赖。
+      - name: Prepare Build Environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: ${{ matrix.TARGET }}
+          gui: false
+          pnpm: false
+          token: ${{ github.token }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ryan-easytier
+          shared-key: ${{ matrix.ARTIFACT_NAME }}
+          cache-targets: false
+
+      # 先编译嵌入 Web 静态资源的版本。
+      - name: Build Embedded Web
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            SUFFIX=".exe"
+          else
+            SUFFIX=""
+          fi
+
+          cargo build \
+            --release \
+            --target "$TARGET" \
+            --package easytier-web \
+            --features embed
+
+          mv \
+            "./target/$TARGET/release/easytier-web${SUFFIX}" \
+            "./target/$TARGET/release/easytier-web-embed${SUFFIX}"
+
+      # 和官方 core.yml 保持相同思路：
+      # 构建 EasyTier 默认成员，并额外启用对应 allocator。
+      - name: Build EasyTier
+        run: |
+          cargo build \
+            --release \
+            --target "$TARGET" \
+            --features "$ALLOCATOR"
+
+      - name: Collect Artifacts
+        run: |
+          mkdir -p artifacts
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            SUFFIX=".exe"
+          else
+            SUFFIX=""
+          fi
+
+          for BIN in \
+            easytier-core \
+            easytier-cli \
+            easytier-web \
+            easytier-web-embed
+          do
+            FILE="./target/$TARGET/release/${BIN}${SUFFIX}"
+
+            if [[ -f "$FILE" ]]; then
+              cp "$FILE" artifacts/
+            fi
+          done
+
+          # Windows 运行时还需要 WinDivert 等 DLL/SYS。
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            find easytier/third_party/x86_64 \
+              -maxdepth 1 \
+              -type f \
+              \( -name "*.dll" -o -name "*.sys" \) \
+              -exec cp {} artifacts/ \;
+          fi
+
+          echo "=== Artifacts ==="
+          ls -lh artifacts/
+
+      - name: Generate Build Metadata
+        run: |
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "target=$TARGET"
+            echo "artifact=$ARTIFACT_NAME"
+            echo "allocator=$ALLOCATOR"
+            echo "build_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          } > artifacts/BUILD_INFO.txt
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: easytier-${{ matrix.ARTIFACT_NAME }}
+          path: artifacts/*
+          retention-days: 14
+
+  # 用本次 ARM64 构建直接制作 KernelSU / Magisk 安装包
+  build_magisk:
+    name: Build KernelSU Magisk Module
+    needs:
+      - build_web
+      - build
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download Linux ARM64
+        uses: actions/download-artifact@v5
+        with:
+          name: easytier-linux-aarch64
+          path: downloaded-binaries/
+
+      - name: Download Web Assets
+        uses: actions/download-artifact@v5
+        with:
+          name: easytier-web-dashboard
+          path: downloaded-webui/
+
+      - name: Prepare Module
+        run: |
+          set -eux
+
+          MODULE_DIR="$GITHUB_WORKSPACE/dist/easytier-magisk"
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp -a \
+            "$GITHUB_WORKSPACE/easytier-contrib/easytier-magisk" \
+            "$MODULE_DIR"
+
+          # 这些是源码仓库构建辅助文件，不需要放进安装包。
+          rm -f \
+            "$MODULE_DIR/build.sh" \
+            "$MODULE_DIR/magisk_update.json"
+
+          mkdir -p "$MODULE_DIR/webroot"
+
+          cp \
+            "$GITHUB_WORKSPACE/downloaded-binaries/easytier-core" \
+            "$MODULE_DIR/easytier-core"
+
+          cp \
+            "$GITHUB_WORKSPACE/downloaded-binaries/easytier-cli" \
+            "$MODULE_DIR/easytier-cli"
+
+          cp \
+            "$GITHUB_WORKSPACE/downloaded-binaries/easytier-web" \
+            "$MODULE_DIR/easytier-web"
+
+          cp -R \
+            "$GITHUB_WORKSPACE/downloaded-webui/config-generator/." \
+            "$MODULE_DIR/webroot/"
+
+          chmod 0755 \
+            "$MODULE_DIR/easytier-core" \
+            "$MODULE_DIR/easytier-cli" \
+            "$MODULE_DIR/easytier-web"
+
+          echo "=== module.prop ==="
+          cat "$MODULE_DIR/module.prop"
+
+          echo "=== module files ==="
+          find "$MODULE_DIR" -maxdepth 2 -type f | sort
+
+      - name: Create Magisk ZIP
+        run: |
+          set -eux
+
+          SHORT_SHA="${GITHUB_SHA:0:8}"
+          ZIP_NAME="Easytier-Magisk-2.7-dev-${SHORT_SHA}.zip"
+
+          cd "$GITHUB_WORKSPACE/dist/easytier-magisk"
+
+          zip -r \
+            "$GITHUB_WORKSPACE/dist/$ZIP_NAME" \
+            .
+
+          echo "MAGISK_ZIP=$ZIP_NAME" >> "$GITHUB_ENV"
+
+          ls -lh "$GITHUB_WORKSPACE/dist/$ZIP_NAME"
+
+      - name: Upload Magisk ZIP
+        uses: actions/upload-artifact@v5
+        with:
+          name: Easytier-Magisk
+          path: dist/${{ env.MAGISK_ZIP }}
+          retention-days: 14
