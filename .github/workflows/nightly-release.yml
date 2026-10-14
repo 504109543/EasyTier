@@ -2,6 +2,11 @@ name: EasyTier Nightly Release
 
 on:
   workflow_call:
+    inputs:
+      sha:
+        description: Commit whose full builds the caller has waited for
+        required: true
+        type: string
   workflow_run:
     workflows: [EasyTier Core, EasyTier GUI, EasyTier Mobile, EasyTier Test]
     branches: [main]
@@ -33,11 +38,13 @@ jobs:
       - name: Select complete main builds and prepare release notes
         id: prepare
         uses: actions/github-script@v8
+        env:
+          BUILD_SHA: ${{ inputs.sha }}
         with:
           script: |
             const fs = require('node:fs');
             const { prepare } = require('./.github/scripts/nightly-release.js');
-            const build = await prepare({ github, context, core });
+            const build = await prepare({ github, context, core, sha: process.env.BUILD_SHA });
             if (!build) return;
             fs.writeFileSync('nightly-release.json', JSON.stringify(build));
             for (const workflow of ['core', 'gui', 'mobile']) {
@@ -76,16 +83,16 @@ jobs:
           artifact-ids: ${{ steps.prepare.outputs.mobile_artifact_ids }}
           path: ${{ steps.prepare.outputs.mobile_path }}
 
-      - name: Package assets with stable names
+      - name: Package assets like version releases
         if: steps.prepare.outputs.ready == 'true'
-        shell: bash
-        run: |
-          mkdir nightly-assets
-          chmod -R 755 nightly-artifacts
-          for artifact in nightly-artifacts/*; do
-            name=$(basename "$artifact")
-            (cd "$artifact" && zip -qr "$GITHUB_WORKSPACE/nightly-assets/$name.zip" .)
-          done
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { packageAssets } = require('./.github/scripts/nightly-release.js');
+            const build = require(`${process.env.GITHUB_WORKSPACE}/nightly-release.json`);
+            await packageAssets({ build, source: 'nightly-artifacts', directory: 'nightly-assets' });
+            fs.writeFileSync('nightly-release.json', JSON.stringify(build));
 
       - name: Update the fixed nightly prerelease
         if: steps.prepare.outputs.ready == 'true'
